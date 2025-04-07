@@ -37,7 +37,7 @@ export function useChat() {
       setIsLoading(true)
 
       try {
-        const response = await fetch("http://api.rycerz.es/v1/chat/completions", {
+        const response = await fetch("https://api.rycerz.es/v1/chat/completions", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
