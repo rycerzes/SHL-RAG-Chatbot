@@ -21,7 +21,7 @@ export function extractRecommendations(text: string): Recommendation[] {
   
   // Start from index 1 to skip header
   for (let i = 1; i < rows.length; i++) {
-    const [_, name, url, remote_testing, adaptive_irt, test_type] = rows[i]
+    const [name, url, remote_testing, adaptive_irt, test_type] = rows[i]
     
     // Clean up the URL (if it's a markdown link)
     const cleanUrl = url.trim().replace(/\[(.+?)\]\((.+?)\)/, "$2")

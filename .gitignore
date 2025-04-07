@@ -10,3 +10,6 @@ wheels/
 .venv
 
 shl_catalog_pages/
+
+.env*
+!.env.example

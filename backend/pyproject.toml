@@ -6,8 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4>=4.13.3",
+    "deepeval>=2.6.7",
     "dotenv>=0.9.9",
     "fastapi[standard]>=0.115.12",
+    "google-generativeai>=0.8.4",
     "llama-index>=0.12.28",
     "llama-index-embeddings-nvidia>=0.3.3",
     "llama-index-llms-groq>=0.3.1",
