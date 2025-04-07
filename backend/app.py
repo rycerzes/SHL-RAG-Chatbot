@@ -244,6 +244,53 @@ async def chat_completion(request: ChatCompletionRequest):
 
             context = "\n---\n".join(context_parts)
 
+        # Check if the query is a general greeting or conversation starter
+        greeting_patterns = ["hello", "hi", "hey", "greetings", "good morning", "good afternoon", "good evening", "how are you"]
+        is_greeting = query.lower().strip() in greeting_patterns or query.lower().strip().startswith(tuple(greeting_patterns))
+
+        if is_greeting:
+            # For greetings, return a conversational response instead of recommendations
+            prompt = f"""The user said: "{query}". This appears to be a greeting or general conversation starter.
+            
+            Please respond with a friendly greeting and briefly explain what this API can help with:
+            
+            "This API can help you find SHL assessment solutions based on your hiring or development needs. 
+            Could you provide details about what type of assessment you're looking for? 
+            For example, you might ask about assessments for software developers, customer service roles, 
+            or specific skills and competencies."
+            """
+            
+            est_input_tokens = len(query) // 4  # Simple estimate
+            llm_response = await get_llm_response(prompt, "", model=request.model)
+            est_output_tokens = len(llm_response) // 4  # Simple estimate
+            
+            # Rest of the function continues as normal
+            total_tokens = est_input_tokens + est_output_tokens
+
+            now = time.time()
+            for _ in range(total_tokens):
+                token_bucket.append(now)
+
+            return ChatCompletionResponse(
+                id=f"chatcmpl-{os.urandom(4).hex()}",
+                object="chat.completion",
+                created=int(now),
+                model=request.model,
+                choices=[
+                    ChatCompletionChoice(
+                        index=0,
+                        message=Message(role="assistant", content=llm_response),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=ChatCompletionUsage(
+                    prompt_tokens=est_input_tokens,
+                    completion_tokens=est_output_tokens,
+                    total_tokens=total_tokens,
+                ),
+            )
+
+        # For regular queries, continue with the normal recommendation flow
         recommendations_table = "Here are the recommended SHL test solutions:\n\n"
         recommendations_table += (
             "| Assessment Name | URL | Remote Testing | Adaptive/IRT | Test Type |\n"
