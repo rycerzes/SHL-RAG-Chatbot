@@ -1,54 +1,39 @@
-import type { Recommendation } from "@/components/recommendation-table"
+import { Recommendation } from "@/components/recommendation-table"
 
-export function extractRecommendations(content: string): Recommendation[] {
-  // Check if the content contains a markdown table
-  if (!content.includes("| --- |")) {
+export function extractRecommendations(text: string): Recommendation[] {
+  // Look for markdown tables in the content
+  const tableRegex = /\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|/g
+  const headerRegex = /\|\s*-+\s*\|\s*-+\s*\|\s*-+\s*\|\s*-+\s*\|\s*-+\s*\|/
+
+  // If table header separator doesn't exist, return empty array
+  if (!headerRegex.test(text)) {
     return []
   }
 
-  try {
-    // Extract the table from the content
-    const tableRegex = /\|(.+)\|[\s\S]+?\|([\s-]+\|)+[\s\S]+?(?=\n\n|\n$|$)/g
-    const tableMatch = content.match(tableRegex)
+  // Find all rows (excluding the header separator row)
+  const rows = [...text.matchAll(tableRegex)].filter(match => {
+    // Filter out header separator row (contains dashes)
+    return !match[0].includes("---") && !match[0].includes("| ---");
+  });
+
+  // Skip the header row (first row after filtering)
+  const recommendations: Recommendation[] = []
+  
+  // Start from index 1 to skip header
+  for (let i = 1; i < rows.length; i++) {
+    const [_, name, url, remote_testing, adaptive_irt, test_type] = rows[i]
     
-    if (!tableMatch) return []
+    // Clean up the URL (if it's a markdown link)
+    const cleanUrl = url.trim().replace(/\[(.+?)\]\((.+?)\)/, "$2")
     
-    const tableContent = tableMatch[0]
-    const lines = tableContent.split('\n').filter(line => line.trim() !== '')
-    
-    // If we don't have at least header, separator, and one data row
-    if (lines.length < 3) return []
-    
-    // Extract headers
-    const headers = lines[0].split('|')
-      .map(h => h.trim())
-      .filter(h => h)
-    
-    // Skip the header and separator lines
-    const dataRows = lines.slice(2)
-    
-    return dataRows.map(row => {
-      const cells = row.split('|')
-        .map(cell => cell.trim())
-        .filter(cell => cell !== '')
-      
-      // Map cells to their corresponding headers
-      const nameIndex = headers.findIndex(h => h.toLowerCase().includes('name') || h.toLowerCase().includes('assessment'))
-      const urlIndex = headers.findIndex(h => h.toLowerCase().includes('url'))
-      const remoteIndex = headers.findIndex(h => h.toLowerCase().includes('remote'))
-      const adaptiveIndex = headers.findIndex(h => h.toLowerCase().includes('adaptive'))
-      const typeIndex = headers.findIndex(h => h.toLowerCase().includes('type'))
-      
-      return {
-        name: cells[nameIndex >= 0 ? nameIndex : 0] || '',
-        url: cells[urlIndex >= 0 ? urlIndex : 1] || '',
-        remote_testing: cells[remoteIndex >= 0 ? remoteIndex : 2] || '',
-        adaptive_irt: cells[adaptiveIndex >= 0 ? adaptiveIndex : 3] || '',
-        test_type: cells[typeIndex >= 0 ? typeIndex : 4] || ''
-      }
+    recommendations.push({
+      name: name.trim(),
+      url: cleanUrl,
+      remote_testing: remote_testing.trim(),
+      adaptive_irt: adaptive_irt.trim(),
+      test_type: test_type.trim()
     })
-  } catch (error) {
-    console.error('Error extracting recommendations:', error)
-    return []
   }
+
+  return recommendations
 }

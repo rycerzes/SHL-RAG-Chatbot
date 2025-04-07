@@ -20,6 +20,21 @@ interface ChatMessageProps {
 export function ChatMessage({ message }: ChatMessageProps) {
   const isUser = message.role === "user"
   const recommendations = !isUser ? extractRecommendations(message.content) : null
+  
+  // Create a content version without the table if recommendations exist
+  let displayContent = message.content
+  if (recommendations && recommendations.length > 0) {
+    // Remove the table from the content to avoid duplicate display
+    const tableStartIndex = displayContent.indexOf('| ---') || displayContent.indexOf('|---')
+    if (tableStartIndex > 0) {
+      const tableHeaderIndex = displayContent.lastIndexOf('|', tableStartIndex - 1)
+      const tableEndIndex = displayContent.indexOf('\n', tableStartIndex)
+      if (tableHeaderIndex > 0 && tableEndIndex > 0) {
+        const restOfContent = displayContent.substring(tableEndIndex).trim()
+        displayContent = displayContent.substring(0, tableHeaderIndex) + '\n' + restOfContent
+      }
+    }
+  }
 
   return (
     <div className={cn("flex w-full items-start gap-x-4", isUser && "justify-end")}>
@@ -40,17 +55,17 @@ export function ChatMessage({ message }: ChatMessageProps) {
           ) : (
             <div className="whitespace-pre-wrap break-words prose prose-invert prose-sm max-w-none">
               <ReactMarkdown>
-                {message.content}
+                {displayContent}
               </ReactMarkdown>
+              
+              {recommendations && recommendations.length > 0 && (
+                <div className="mt-3 w-full">
+                  <RecommendationTable recommendations={recommendations} />
+                </div>
+              )}
             </div>
           )}
         </div>
-
-        {recommendations && recommendations.length > 0 && (
-          <div className="mt-3 w-full">
-            <RecommendationTable recommendations={recommendations} />
-          </div>
-        )}
       </div>
 
       {isUser && (
