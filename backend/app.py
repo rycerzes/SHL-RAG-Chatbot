@@ -106,6 +106,19 @@ class RecommendationsResponse(BaseModel):
     recommendations: List[RecommendationItem]
 
 
+class AssessmentItem(BaseModel):
+    url: str
+    adaptive_support: str
+    description: str
+    duration: int = 60
+    remote_support: str
+    test_type: List[str]
+
+
+class QueryResponse(BaseModel):
+    recommended_assessments: List[AssessmentItem]
+
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -396,6 +409,109 @@ async def recommend_solutions(request: Request):
                     )
 
         return RecommendationsResponse(recommendations=recommendations[:10])
+
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/recommend",
+    response_model=QueryResponse,
+    dependencies=[Depends(check_rate_limit)],
+)
+async def recommend_endpoint(request: Request):
+    """Endpoint to get assessment recommendations based on job description or natural language query"""
+    try:
+        body = await request.json()
+        query = body.get("query", "")
+
+        if not query:
+            raise HTTPException(status_code=400, detail="Query is required")
+
+        est_tokens = len(query) // 4
+        now = time.time()
+        for _ in range(est_tokens):
+            token_bucket.append(now)
+
+        search_results = brain.search_astra(query, limit=10)
+
+        recommended_assessments = []
+        if search_results and hasattr(search_results, "source_nodes"):
+            seen_names = set()
+
+            for node in search_results.source_nodes:
+                meta = node.metadata
+                name = meta.get("name", "")
+
+                if name and name not in seen_names:
+                    seen_names.add(name)
+                    test_type = meta.get("test_type", "")
+                    test_type_list = [map_test_type_to_full_name(char) for char in test_type if char]
+                    
+                    completion_time = meta.get("completion_time", "60")
+                    try:
+                        if isinstance(completion_time, str):
+                            if "minute" in completion_time.lower():
+                                duration = int(completion_time.split()[0])
+                            else:
+                                duration = int(completion_time)
+                        else:
+                            duration = int(completion_time)
+                    except (ValueError, IndexError):
+                        duration = 60  
+                    
+                    description = meta.get("description", name)
+                    if not description or description == "nan":
+                        description = name
+
+                    recommended_assessments.append(
+                        AssessmentItem(
+                            url=meta.get("link", ""),
+                            adaptive_support="Yes" if meta.get("adaptive_irt", "No") == "Yes" else "No",
+                            description=description,
+                            duration=duration,
+                            remote_support="Yes" if meta.get("remote_testing", "No") == "Yes" else "No",
+                            test_type=test_type_list or ["Not specified"]
+                        )
+                    )
+
+        if not recommended_assessments and search_results and hasattr(search_results, "source_nodes") and search_results.source_nodes:
+            # Get the first node if we have results but none passed our filtering
+            node = search_results.source_nodes[0]
+            meta = node.metadata
+            test_type = meta.get("test_type", "")
+            test_type_list = [map_test_type_to_full_name(char) for char in test_type if char]
+            
+            completion_time = meta.get("completion_time", "60")
+            try:
+                if isinstance(completion_time, str):
+                    if "minute" in completion_time.lower():
+                        duration = int(completion_time.split()[0])
+                    else:
+                        duration = int(completion_time)
+                else:
+                    duration = int(completion_time)
+            except (ValueError, IndexError):
+                duration = 60
+            
+            description = meta.get("description", "")
+            if not description or description == "nan":
+                description = meta.get("name", "")
+
+            recommended_assessments.append(
+                AssessmentItem(
+                    url=meta.get("link", ""),
+                    adaptive_support="Yes" if meta.get("adaptive_irt", "No") == "Yes" else "No",
+                    description=description,
+                    duration=duration,
+                    remote_support="Yes" if meta.get("remote_testing", "No") == "Yes" else "No",
+                    test_type=test_type_list or ["Not specified"]
+                )
+            )
+
+        return QueryResponse(recommended_assessments=recommended_assessments[:10])
 
     except Exception as e:
         if isinstance(e, HTTPException):

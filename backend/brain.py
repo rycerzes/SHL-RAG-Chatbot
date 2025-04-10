@@ -4,6 +4,7 @@ from typing import Tuple, List
 import time
 import re
 import pandas as pd
+import tiktoken
 
 from llama_index.core.schema import Document
 from llama_index.core.node_parser import SentenceSplitter
@@ -11,22 +12,43 @@ from llama_index.vector_stores.astra_db import AstraDBVectorStore
 from llama_index.embeddings.nvidia import NVIDIAEmbedding
 from llama_index.core import StorageContext, VectorStoreIndex
 from llama_index.llms.groq import Groq
-
+from llama_index.postprocessor.nvidia_rerank import NVIDIARerank
 from dotenv import load_dotenv
 
 load_dotenv()
 
 COLLECTION_NAME = os.getenv("ASTRA_DB_COLLECTION", "shl_solutions")
 EMBEDDING_DIMENSION = 1024
-MAX_VECTORIZE_LENGTH = 1000  # 1000 to stay under token limits
-MAX_TOKENS = 475
+MAX_TOKENS = 2000
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+# Reranking configuration
+RERANKER_MODEL = "nvidia/llama-3_2-nv-rerankqa-1b-v2"  # NVIDIA reranker model
+RERANK_TOP_N = 10
+USE_RERANKING = False  # Enable/disable reranking
+
+# Max token limit for NVIDIA embedding model
+# https://forums.developer.nvidia.com/t/discrepancy-in-maximum-token-length-for-nv-embed-qa-1b-v2-model/322768
+NVIDIA_MODEL_MAX_TOKENS = 512
+RAG_CHUNK_SIZE = 400
+RAG_CHUNK_OVERLAP = 50
+
+ENCODING = tiktoken.get_encoding("cl100k_base")
+
+
+def count_tokens(text):
+    """Count tokens in text using tiktoken or estimate based on characters"""
+    if ENCODING:
+        return len(ENCODING.encode(text))
+    else:
+        # Approximate token count (4 chars ≈ 1 token)
+        return len(text) // 4
 
 
 def parse_csv(file: BytesIO, filename: str) -> Tuple[List[dict], str]:
     """Parse CSV file containing SHL solutions data
 
-    The CSV has these headers: Name,Link,Type,Remote Testing,Adaptive/IRT,Test Type
+    The CSV has headers: Name,Link,Type,Remote Testing,Adaptive/IRT,Test Type,Description,Languages,Job_levels,Completion_time
     """
     content = file.read().decode("utf-8")
     csv_data = []
@@ -42,6 +64,15 @@ def parse_csv(file: BytesIO, filename: str) -> Tuple[List[dict], str]:
             "Adaptive/IRT": row["Adaptive/IRT"],
             "Test Type": row["Test Type"],
         }
+        if "Description" in df.columns:
+            item["Description"] = row["Description"]
+        if "Languages" in df.columns:
+            item["Languages"] = row["Languages"]
+        if "Job_levels" in df.columns:
+            item["Job_levels"] = row["Job_levels"]
+        if "Completion_time" in df.columns:
+            item["Completion_time"] = row["Completion_time"]
+
         text_content = (
             f"Name: {item['Name']}\n"
             f"Link: {item['Link']}\n"
@@ -50,6 +81,16 @@ def parse_csv(file: BytesIO, filename: str) -> Tuple[List[dict], str]:
             f"Adaptive/IRT: {item['Adaptive/IRT']}\n"
             f"Test Type: {item['Test Type']}"
         )
+
+        if "Description" in item:
+            text_content += f"\nDescription: {item['Description']}"
+        if "Languages" in item:
+            text_content += f"\nLanguages: {item['Languages']}"
+        if "Job_levels" in item:
+            text_content += f"\nJob levels: {item['Job_levels']}"
+        if "Completion_time" in item:
+            text_content += f"\nCompletion time: {item['Completion_time']}"
+
         item["text_content"] = text_content
         csv_data.append(item)
 
@@ -63,20 +104,88 @@ def text_to_docs(items: List[dict], filename: str) -> List[Document]:
     for i, item in enumerate(items):
         text = item["text_content"]
 
+        # Use sentence splitter with RAG-optimized chunk parameters
         splitter = SentenceSplitter(
-            chunk_size=2000,
-            chunk_overlap=200,
+            chunk_size=RAG_CHUNK_SIZE,
+            chunk_overlap=RAG_CHUNK_OVERLAP,
         )
 
-        nodes = splitter.get_nodes_from_documents([Document(text=text)])
+        # Split into semantic chunks for better RAG performance
+        chunks = splitter.split_text(text)
 
-        for j, node in enumerate(nodes):
-            chunk_text = node.text
+        for j, chunk_text in enumerate(chunks):
+            # Count tokens accurately using tiktoken if available
+            chunk_tokens = count_tokens(chunk_text)
 
-            doc = Document(
-                text=chunk_text,
-                metadata={
+            if chunk_tokens > NVIDIA_MODEL_MAX_TOKENS:
+                # Further split if chunk exceeds token limit
+                sub_chunks = []
+                current_text = ""
+                current_tokens = 0
+
+                # Split by sentences for more semantic chunks
+                sentences = re.split(r"(?<=[.!?])\s+", chunk_text)
+
+                for sentence in sentences:
+                    # Count tokens in this sentence
+                    sentence_tokens = count_tokens(sentence)
+
+                    # If adding this sentence would exceed the limit, create a new chunk
+                    if current_tokens + sentence_tokens > NVIDIA_MODEL_MAX_TOKENS:
+                        if current_text:
+                            sub_chunks.append(current_text.strip())
+                        current_text = sentence
+                        current_tokens = sentence_tokens
+                    else:
+                        if current_text:
+                            current_text += " "
+                        current_text += sentence
+                        current_tokens += sentence_tokens
+
+                # Add the last sub-chunk if it exists
+                if current_text:
+                    sub_chunks.append(current_text.strip())
+
+                # Handle sentences that are individually too long (rare case)
+                final_sub_chunks = []
+                for sub_chunk in sub_chunks:
+                    sub_chunk_tokens = count_tokens(sub_chunk)
+
+                    if sub_chunk_tokens > NVIDIA_MODEL_MAX_TOKENS:
+                        # Hard truncate if a single sentence is too long
+                        if ENCODING:
+                            # Use tiktoken to truncate precisely at token boundaries
+                            tokens = ENCODING.encode(sub_chunk)
+                            truncated_tokens = tokens[
+                                : NVIDIA_MODEL_MAX_TOKENS - 1
+                            ]  # Leave room for potential continuation marker
+                            truncated_text = ENCODING.decode(truncated_tokens) + "..."
+                            final_sub_chunks.append(truncated_text)
+                        else:
+                            # Character-based truncation as fallback
+                            char_limit = NVIDIA_MODEL_MAX_TOKENS * 4
+                            final_sub_chunks.append(sub_chunk[: char_limit - 3] + "...")
+                    else:
+                        final_sub_chunks.append(sub_chunk)
+
+                processed_chunks = final_sub_chunks
+            else:
+                processed_chunks = [chunk_text]
+
+            for k, processed_chunk in enumerate(processed_chunks):
+                # Final verification that chunk is within limits
+                if (
+                    ENCODING
+                    and len(ENCODING.encode(processed_chunk)) > NVIDIA_MODEL_MAX_TOKENS
+                ):
+                    tokens = ENCODING.encode(processed_chunk)
+                    processed_chunk = (
+                        ENCODING.decode(tokens[: NVIDIA_MODEL_MAX_TOKENS - 1]) + "..."
+                    )
+
+                metadata = {
                     "chunk": j,
+                    "sub_chunk": k if len(processed_chunks) > 1 else None,
                     "source": f"{filename}:item-{i}",
                     "filename": filename,
                     "item_index": i,
@@ -86,9 +195,22 @@ def text_to_docs(items: List[dict], filename: str) -> List[Document]:
                     "remote_testing": item.get("Remote Testing", ""),
                     "adaptive_irt": item.get("Adaptive/IRT", ""),
                     "test_type": item.get("Test Type", ""),
-                },
-            )
-            doc_chunks.append(doc)
+                }
+
+                if "Description" in item:
+                    metadata["description"] = item["Description"]
+                if "Languages" in item:
+                    metadata["languages"] = item["Languages"]
+                if "Job_levels" in item:
+                    metadata["job_levels"] = item["Job_levels"]
+                if "Completion_time" in item:
+                    metadata["completion_time"] = item["Completion_time"]
+
+                doc = Document(
+                    text=processed_chunk,
+                    metadata=metadata,
+                )
+                doc_chunks.append(doc)
 
     return doc_chunks
 
@@ -98,13 +220,20 @@ def connect_to_astra():
     token = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
     api_endpoint = os.getenv("ASTRA_DB_API_ENDPOINT")
 
-    if not token:
-        raise ValueError("ASTRA_DB_APPLICATION_TOKEN environment variable is not set")
+    # Add NVIDIA API configuration
+    nvidia_api_key = os.getenv("NVIDIA_API_KEY")
+    nvidia_base_url = "https://integrate.api.nvidia.com/v1"
 
-    if not api_endpoint:
-        raise ValueError("ASTRA_DB_API_ENDPOINT environment variable is not set")
+    if not nvidia_api_key:
+        raise ValueError("NVIDIA_API_KEY environment variable is not set")
 
-    embed_model = NVIDIAEmbedding(model_name="nvidia/embed-qa-4")
+    embed_model = NVIDIAEmbedding(
+        model_name="nvidia/llama-3_2-nv-embedqa-1b-v2",
+        api_key=nvidia_api_key,
+        api_base=nvidia_base_url,
+        max_tokens=NVIDIA_MODEL_MAX_TOKENS,  # Set to 512 token limit
+        embed_batch_size=1,  # Process one input at a time
+    )
 
     astra_db_store = AstraDBVectorStore(
         token=token,
@@ -169,16 +298,101 @@ def get_index_for_csv(csv_files, csv_names):
         print(f"Processing CSV file {i + 1}/{len(csv_files)}: {csv_name}")
         items, filename = parse_csv(BytesIO(csv_file), csv_name)
         doc_chunks = text_to_docs(items, filename)
+
+        # Final verification and hard truncation if needed
+        for doc in doc_chunks:
+            # Ensure text is within token limit
+            token_count = count_tokens(doc.text)
+            if token_count > NVIDIA_MODEL_MAX_TOKENS:
+                if ENCODING:
+                    tokens = ENCODING.encode(doc.text)
+                    doc.text = (
+                        ENCODING.decode(tokens[: NVIDIA_MODEL_MAX_TOKENS - 3]) + "..."
+                    )
+                else:
+                    # Fallback character-based truncation
+                    doc.text = doc.text[: int(NVIDIA_MODEL_MAX_TOKENS * 3.5)] + "..."
+
         documents.extend(doc_chunks)
         print(f"  - Generated {len(doc_chunks)} chunks from {filename}")
 
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
-    index = VectorStoreIndex.from_documents(
-        documents, storage_context=storage_context, embed_model=embed_model
+    # Process documents in smaller batches to avoid batch size issues
+    batch_size = 10
+    all_documents = []
+
+    for i in range(0, len(documents), batch_size):
+        batch = documents[i : i + batch_size]
+        print(
+            f"Processing batch {i // batch_size + 1}/{(len(documents) - 1) // batch_size + 1}"
+        )
+
+        try:
+            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+            batch_index = VectorStoreIndex.from_documents(
+                batch, storage_context=storage_context, embed_model=embed_model
+            )
+            all_documents.extend(batch)
+        except Exception as e:
+            print(f"Error in batch {i // batch_size + 1}: {e}")
+            # Process documents one by one to isolate problematic documents
+            for j, doc in enumerate(batch):
+                try:
+                    single_doc_batch = [doc]
+                    storage_context = StorageContext.from_defaults(
+                        vector_store=vector_store
+                    )
+                    single_index = VectorStoreIndex.from_documents(
+                        single_doc_batch,
+                        storage_context=storage_context,
+                        embed_model=embed_model,
+                    )
+                    all_documents.append(doc)
+                    print(f"  - Successfully processed document {i + j + 1}")
+                except Exception as e2:
+                    token_count = count_tokens(doc.text)
+                    print(
+                        f"  - Failed to process document {i + j + 1} (token count: {token_count}): {e2}"
+                    )
+                    # Super aggressive truncation as last resort
+                    try:
+                        if token_count > NVIDIA_MODEL_MAX_TOKENS:
+                            if ENCODING:
+                                tokens = ENCODING.encode(doc.text)
+                                doc.text = (
+                                    ENCODING.decode(
+                                        tokens[: NVIDIA_MODEL_MAX_TOKENS // 2]
+                                    )
+                                    + "..."
+                                )
+                            else:
+                                doc.text = (
+                                    doc.text[: NVIDIA_MODEL_MAX_TOKENS * 2] + "..."
+                                )
+
+                            storage_context = StorageContext.from_defaults(
+                                vector_store=vector_store
+                            )
+                            single_index = VectorStoreIndex.from_documents(
+                                [doc],
+                                storage_context=storage_context,
+                                embed_model=embed_model,
+                            )
+                            all_documents.append(doc)
+                            print(
+                                f"  - Salvaged document {i + j + 1} after aggressive truncation"
+                            )
+                    except Exception as e3:
+                        print(
+                            f"  - Could not salvage document {i + j + 1} even after truncation: {e3}"
+                        )
+
+    print(
+        f"Successfully indexed {len(all_documents)} out of {len(documents)} documents in AstraDB"
     )
 
-    print(f"Successfully indexed {len(documents)} documents in AstraDB")
-    return index
+    # Return latest index for consistency with original function
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    return VectorStoreIndex.from_vector_store(vector_store, embed_model=embed_model)
 
 
 def search_astra(query, limit=5):
@@ -193,8 +407,30 @@ def search_astra(query, limit=5):
     StorageContext.from_defaults(vector_store=vector_store)
     index = VectorStoreIndex.from_vector_store(vector_store, embed_model=embed_model)
 
-    # Pass the LLM to the query engine or use None to disable LLM
-    query_engine = index.as_query_engine(similarity_top_k=limit, llm=llm)
+    # Apply reranking if enabled
+    if USE_RERANKING:
+        nvidia_api_key = os.getenv("NVIDIA_API_KEY")
+        nvidia_base_url = "https://integrate.api.nvidia.com/v1"
+
+        if not nvidia_api_key:
+            raise ValueError("NVIDIA_API_KEY environment variable is not set")
+
+        reranker = NVIDIARerank(
+            model_name=RERANKER_MODEL,
+            api_key=nvidia_api_key,
+            api_base=nvidia_base_url,
+            top_n=limit,  # Keep only top 'limit' results after reranking
+        )
+
+        # Create retriever with higher top_k for reranking
+        retriever = index.as_retriever(similarity_top_k=RERANK_TOP_N)
+
+        # Use the retriever with node postprocessors
+        query_engine = retriever.as_query_engine(
+            node_postprocessors=[reranker], llm=llm
+        )
+    else:
+        query_engine = index.as_query_engine(similarity_top_k=limit, llm=llm)
 
     response = query_engine.query(query)
 
@@ -281,21 +517,37 @@ if __name__ == "__main__":
         print(f"Searching for: '{query}' (limit: {limit})")
 
         try:
-            results = search_astra(query, limit)
+            response = search_astra(query, limit)
 
-            if not results:
-                print("No results found.")
+            # Handle different response types correctly
+            if hasattr(response, "response"):
+                # This is a response from the LLM
+                print("\n=== LLM Response ===")
+                print(response.response)
+
+                if hasattr(response, "source_nodes") and response.source_nodes:
+                    print("\n=== Sources ===")
+                    for i, source_node in enumerate(response.source_nodes):
+                        metadata = source_node.metadata
+                        name = metadata.get("name", "Unknown")
+                        link = metadata.get("link", "No link available")
+                        source = metadata.get("source", "Unknown source")
+
+                        print(f"\n--- Source {i + 1} ---")
+                        print(f"Name: {name}")
+                        print(f"Link: {link}")
+                        print(f"Source: {source}")
             else:
-                print(f"Found {len(results)} results:")
+                # This is just a list of results without LLM processing
+                print(f"Found {len(response)} results:")
 
-                for i, result in enumerate(results):
-                    similarity = result.similarity * 100
+                for i, result in enumerate(response):
                     metadata = result.metadata
                     name = metadata.get("name", "Unknown")
                     link = metadata.get("link", "No link available")
                     source = metadata.get("source", "Unknown source")
 
-                    print(f"\n--- Result {i + 1} (Similarity: {similarity:.2f}%) ---")
+                    print(f"\n--- Result {i + 1} ---")
                     print(f"Name: {name}")
                     print(f"Link: {link}")
                     print(f"Source: {source}")
@@ -308,6 +560,9 @@ if __name__ == "__main__":
 
         except Exception as e:
             print(f"Error during search: {e}")
+            import traceback
+
+            traceback.print_exc()
 
     else:
         print(f"Unknown command: {command}")
