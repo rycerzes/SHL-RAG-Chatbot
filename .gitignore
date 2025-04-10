@@ -10,6 +10,6 @@ wheels/
 .venv
 
 shl_catalog_pages/
-
+shl_catalog_product_pages/
 .env*
 !.env.example
